@@ -3,18 +3,20 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"strings"
 
 	"github.com/cloudflare/cloudflare-go"
-	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 )
 
 type DNSDomain struct {
 	Domain string
 	Sub    string
+	Tag    string
 }
 
 func (d DNSDomain) BuildHostname(host string) string {
@@ -31,7 +33,7 @@ func (d DNSDomain) String() string {
 
 type tailHost struct {
 	Name string
-	IP   netaddr.IP
+	IP   netip.Addr
 }
 
 func (t tailHost) RecordType() string {
@@ -63,6 +65,7 @@ func main() {
 	var alias arrayFlags
 	flag.StringVar(&dd.Domain, "zone", "", "zone, ex. example.com")
 	flag.StringVar(&dd.Sub, "subdomain", "", "subdomain to use, e.g. 'wg' will make dns records as <tailscale host>.wg.example.com")
+	flag.StringVar(&dd.Tag, "tag", "", "only add records for hosts with this tag")
 	flag.BoolVar(&removeUnused, "remove-orphans", false, "remove DNS records that are not in tailscale")
 	flag.BoolVar(&removeAll, "remove-all", false, "remove all tailscale dns records")
 	flag.Var(&alias, "alias", "alias records")
@@ -93,11 +96,23 @@ func main() {
 		})
 	}
 	for _, peer := range status.Peer {
+		if !peer.Online {
+			continue
+		}
+		fmt.Printf("Peer %s online: %v\n", peer.HostName, peer.Online)
 		for _, ip := range peer.TailscaleIPs {
-			hostList = append(hostList, tailHost{
-				Name: sanitizeHost(peer.HostName),
-				IP:   ip,
-			})
+			if peer.Tags == nil {
+				continue
+			}
+			for _, t := range peer.Tags.All() {
+				if dd.Tag != "" && t == dd.Tag {
+					fmt.Printf("peer %s has tag %s\n", peer.HostName, t)
+					hostList = append(hostList, tailHost{
+						Name: sanitizeHost(peer.HostName),
+						IP:   ip,
+					})
+				}
+			}
 		}
 	}
 
@@ -124,7 +139,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	currentRecords, err := api.DNSRecords(ctx, zoneID, cloudflare.DNSRecord{})
+	currentRecords, _, err := api.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListDNSRecordsParams{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -138,7 +153,7 @@ func main() {
 		for _, r := range currentRecords {
 			if (r.Type == "A" || r.Type == "AAAA") && strings.HasSuffix(r.Name, dd.String()) {
 				log.Printf("removing record with name %s, ip %s", r.Name, r.Content)
-				if err := api.DeleteDNSRecord(ctx, zoneID, r.ID); err != nil {
+				if err := api.DeleteDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), r.ID); err != nil {
 					log.Fatal(err)
 				}
 			}
@@ -150,7 +165,7 @@ func main() {
 	for _, t := range hostList {
 		recordType := t.RecordType()
 		recordName := dd.BuildHostname(t.Name)
-		cfDnsRecord := cloudflare.DNSRecord{
+		cfDnsRecord := cloudflare.UpdateDNSRecordParams{
 			Type:    recordType,
 			Name:    recordName,
 			Content: t.IP.String(),
@@ -158,11 +173,24 @@ func main() {
 		}
 		action := "updated"
 		var err error
-		if r, exists := currentRecordMap[strings.ToLower(recordType+recordName)]; exists {
-			err = api.UpdateDNSRecord(ctx, zoneID, r.ID, cfDnsRecord)
+		if _, exists := currentRecordMap[strings.ToLower(recordType+recordName)]; exists {
+			cfDnsRecord := cloudflare.UpdateDNSRecordParams{
+				Type:    recordType,
+				Name:    recordName,
+				Content: t.IP.String(),
+				TTL:     1,
+				ID:      currentRecordMap[strings.ToLower(recordType+recordName)].ID,
+			}
+			_, err = api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), cfDnsRecord)
 		} else {
+			cfDnsRecord := cloudflare.CreateDNSRecordParams{
+				Type:    recordType,
+				Name:    recordName,
+				Content: t.IP.String(),
+				TTL:     1,
+			}
 			action = "created"
-			_, err = api.CreateDNSRecord(ctx, zoneID, cfDnsRecord)
+			_, err = api.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), cfDnsRecord)
 		}
 		if err != nil {
 			log.Fatalf("unable to create record %v. err: %v", cfDnsRecord, err)
@@ -176,7 +204,7 @@ func main() {
 			if strings.HasSuffix(r.Name, dd.String()) {
 				if _, exists := tHostMap[strings.ToLower(r.Type+r.Name)]; !exists {
 					log.Printf("removing record with name %s, ip %s", r.Name, r.Content)
-					if err := api.DeleteDNSRecord(ctx, zoneID, r.ID); err != nil {
+					if err := api.DeleteDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), r.ID); err != nil {
 						log.Fatal(err)
 					}
 				}
