@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net/netip"
 	"os"
@@ -99,14 +98,13 @@ func main() {
 		if !peer.Online {
 			continue
 		}
-		fmt.Printf("Peer %s online: %v\n", peer.HostName, peer.Online)
+
 		for _, ip := range peer.TailscaleIPs {
 			if peer.Tags == nil {
 				continue
 			}
 			for _, t := range peer.Tags.All() {
 				if dd.Tag != "" && t == dd.Tag {
-					fmt.Printf("peer %s has tag %s\n", peer.HostName, t)
 					hostList = append(hostList, tailHost{
 						Name: sanitizeHost(peer.HostName),
 						IP:   ip,
